@@ -688,32 +688,36 @@ def upscale_all_batches(
             noises = [base_noise]
             aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
             
-            if noise_mask is not None and latent_noise_scale > 0:
-                import torch.nn.functional as F
-                import numpy as np
-                mask_t = torch.from_numpy(noise_mask).to(device=latent.device, dtype=latent.dtype)
-                # latent is [T, H, W, C] — resize mask to latent spatial dims
-                h_lat, w_lat = latent.shape[1], latent.shape[2]
-                mask_t = F.interpolate(
-                    mask_t.unsqueeze(0).unsqueeze(0),
-                    size=(h_lat, w_lat),
-                    mode='bilinear',
-                    align_corners=False,
-                ).squeeze(0).squeeze(0)  # [H_lat, W_lat]
-                mask_t = mask_t.unsqueeze(0).unsqueeze(-1)  # [1, H_lat, W_lat, 1] -> broadcasts over [T, H, W, C]
-                aug_noises = [aug_noises[0] * mask_t]
-                debug.log(
-                    'Spatial noise mask applied — latent [' + str(h_lat) + 'x' + str(w_lat) + '], '
-                    'mask range [' + str(round(float(noise_mask.min()), 3)) + ', ' + str(round(float(noise_mask.max()), 3)) + ']',
-                    category='generation',
-                )
-            
             # Log latent noise application if enabled
             if latent_noise_scale > 0:
                 debug.log(f"Applying latent noise (scale: {latent_noise_scale:.3f})", category="generation")
             
             def _add_noise(x, aug_noise):
                 if latent_noise_scale == 0.0:
+                    return x
+                if noise_mask is not None:
+                    import torch.nn.functional as F_ns
+                    mask_tensor = torch.from_numpy(noise_mask).to(device=ctx['dit_device'], dtype=ctx['compute_dtype'])
+                    h_lat, w_lat = x.shape[1], x.shape[2]  # x is [T, H, W, C]
+                    mask_tensor = F_ns.interpolate(
+                        mask_tensor.unsqueeze(0).unsqueeze(0),
+                        size=(h_lat, w_lat),
+                        mode='bilinear',
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)  # [H_lat, W_lat]
+                    # Spatial t: [1, H, W, 1] broadcasts over [T, H, W, C]
+                    # At mask=0 → t=0 → A(t)=1, B(t)=0 → pure clean latent (identical to lns=0 path)
+                    # At mask=1 → t=lns*1000 → standard noise injection
+                    t_spatial = (mask_tensor * 1000.0 * latent_noise_scale).unsqueeze(0).unsqueeze(-1)
+                    # expand_dims in schedule.forward: t_spatial.ndim==4, x.ndim==4 → 0 trailing dims added, no change
+                    x = runner.schedule.forward(x, aug_noise, t_spatial)
+                    debug.log(
+                        'Spatial t mask: latent [' + str(h_lat) + 'x' + str(w_lat) + '], '
+                        't_max=' + str(round(1000.0 * latent_noise_scale, 1)) + ', '
+                        'mask_range=[' + str(round(float(noise_mask.min()), 3)) + ', ' + str(round(float(noise_mask.max()), 3)) + ']',
+                        category='generation',
+                    )
+                    del mask_tensor, t_spatial
                     return x
                 t = torch.tensor([1000.0], device=ctx['dit_device'], dtype=ctx['compute_dtype']) * latent_noise_scale
                 shape = torch.tensor(x.shape[1:], device=ctx['dit_device'])[None]
