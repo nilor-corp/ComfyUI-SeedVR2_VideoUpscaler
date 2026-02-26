@@ -979,10 +979,17 @@ def _process_frames_core(
     )
     
     # Phase 2: Upscale
+    noise_mask_array = None
+    if args.noise_mask is not None:
+        import numpy as np
+        noise_mask_array = np.load(args.noise_mask).astype(np.float32)
+        print(f"[noise_mask] Loaded {args.noise_mask} — shape {noise_mask_array.shape}, "
+              f"range [{noise_mask_array.min():.3f}, {noise_mask_array.max():.3f}]")
     ctx = upscale_all_batches(
         runner, ctx=ctx, debug=debug, progress_callback=None,
         seed=args.seed,
         latent_noise_scale=args.latent_noise_scale,
+        noise_mask=noise_mask_array,
         cache_model=cache_dit
     )
     
@@ -1403,6 +1410,11 @@ Examples:
                         help="Input noise injection scale (0.0-1.0). Adds variation to input images (default: 0.0)")
     quality_group.add_argument("--latent_noise_scale", type=float, default=0.0,
                         help="Latent noise injection scale (0.0-1.0). Adds variation to latent space (default: 0.0)")
+    quality_group.add_argument("--noise_mask", type=str, default=None,
+                        help="Path to a .npy spatial mask file [H, W] with values [0, 1]. Applied to aug_noise before "
+                             "diffusion — high values enhance aggressively, low values stay faithful. Requires "
+                             "--latent_noise_scale > 0. Mask is automatically resized to latent spatial dimensions. "
+                             "Generate with scripts/generate_noise_mask.py. (default: None — uniform noise)")
     
     # Device Management
     device_group = parser.add_argument_group('Device management')

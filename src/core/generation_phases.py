@@ -546,6 +546,7 @@ def upscale_all_batches(
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     seed: int = 42,
     latent_noise_scale: float = 0.0,
+    noise_mask=None,
     cache_model: bool = False
 ) -> Dict[str, Any]:
     """
@@ -564,6 +565,11 @@ def upscale_all_batches(
                            Adds noise during diffusion conditioning. Can soften details
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
+        noise_mask: Optional numpy array [H, W] with values in [0, 1]. When provided,
+                    multiplies aug_noise spatially so high-mask regions get more noise
+                    (stronger enhancement) and low-mask regions get less (more faithful).
+                    Resized to latent spatial dimensions automatically. Requires
+                    latent_noise_scale > 0 to have any effect.
         cache_model: If True, keep DiT model for reuse instead of deleting it
         
     Returns:
@@ -681,6 +687,26 @@ def upscale_all_batches(
             
             noises = [base_noise]
             aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
+            
+            if noise_mask is not None and latent_noise_scale > 0:
+                import torch.nn.functional as F
+                import numpy as np
+                mask_t = torch.from_numpy(noise_mask).to(device=latent.device, dtype=latent.dtype)
+                # latent is [T, H, W, C] — resize mask to latent spatial dims
+                h_lat, w_lat = latent.shape[1], latent.shape[2]
+                mask_t = F.interpolate(
+                    mask_t.unsqueeze(0).unsqueeze(0),
+                    size=(h_lat, w_lat),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)  # [H_lat, W_lat]
+                mask_t = mask_t.unsqueeze(0).unsqueeze(-1)  # [1, H_lat, W_lat, 1] -> broadcasts over [T, H, W, C]
+                aug_noises = [aug_noises[0] * mask_t]
+                debug.log(
+                    'Spatial noise mask applied — latent [' + str(h_lat) + 'x' + str(w_lat) + '], '
+                    'mask range [' + str(round(float(noise_mask.min()), 3)) + ', ' + str(round(float(noise_mask.max()), 3)) + ']',
+                    category='generation',
+                )
             
             # Log latent noise application if enabled
             if latent_noise_scale > 0:
