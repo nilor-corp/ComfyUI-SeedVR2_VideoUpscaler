@@ -105,6 +105,7 @@ else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 # Heavy dependency imports after environment configuration
+import json
 import torch
 import cv2
 import numpy as np
@@ -533,6 +534,14 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         
         # Single GPU: stream in main process
         else:
+            # Checkpoints live alongside the output file: <output_dir>/checkpoints/
+            # Only active in streaming mode; skipped for single-chunk (non-streaming) runs.
+            ckpt_dir = (
+                os.path.join(str(Path(output_path).parent), 'checkpoints')
+                if streaming and output_path
+                else None
+            )
+
             chunk_count = 0
             for result in _stream_video_chunks(
                 cap=cap,
@@ -545,7 +554,8 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 runner_cache=runner_cache,
                 log_progress=streaming,
                 total_chunks=total_chunks,
-                cleanup_timer_name="chunk_cleanup"
+                cleanup_timer_name="chunk_cleanup",
+                checkpoint_dir=ckpt_dir,
             ):
                 chunk_count += 1
                 
@@ -618,6 +628,89 @@ def _read_frames_from_cap(cap: cv2.VideoCapture, max_frames: int) -> Optional[to
     return torch.from_numpy(np.stack(frames)).to(torch.float32)
 
 
+def _save_chunk_checkpoint(
+    checkpoint_dir: str,
+    chunk_idx: int,
+    result: torch.Tensor,
+    input_tail: Optional[torch.Tensor],
+    frame_start: int,
+    frame_end: int,
+    total_chunks: int,
+) -> None:
+    """
+    Atomically save a completed chunk checkpoint.
+
+    Writes three files using .tmp-then-rename to guarantee atomicity:
+      chunk_NNNN.pt            — processed output frames (fp16)
+      chunk_NNNN_input_tail.pt — raw input tail for the next chunk's temporal context
+      chunk_NNNN.json          — metadata (indices, shape, total_chunks)
+
+    A .tmp orphan (from a prior crash mid-write) marks the chunk as incomplete.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    base = os.path.join(checkpoint_dir, f'chunk_{chunk_idx:04d}')
+
+    torch.save(result.cpu().to(torch.float16), base + '.pt.tmp')
+    os.rename(base + '.pt.tmp', base + '.pt')
+
+    tail_to_save = input_tail.cpu() if input_tail is not None else torch.empty(0)
+    torch.save(tail_to_save, base + '_input_tail.pt.tmp')
+    os.rename(base + '_input_tail.pt.tmp', base + '_input_tail.pt')
+
+    meta = {
+        'chunk_idx': chunk_idx,
+        'frame_start': frame_start,
+        'frame_end': frame_end,
+        'shape': list(result.shape),
+        'dtype': 'float16',
+        'total_chunks': total_chunks,
+    }
+    with open(base + '.json.tmp', 'w') as f:
+        json.dump(meta, f, indent=2)
+    os.rename(base + '.json.tmp', base + '.json')
+
+
+def _scan_checkpoints(checkpoint_dir: str) -> Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """
+    Scan a checkpoint directory for completed chunks.
+
+    A chunk is complete when all three files exist (.pt, _input_tail.pt, .json)
+    and no .tmp orphans are present (which indicate a crash mid-write).
+
+    Returns:
+        Dict mapping chunk_idx -> (result_tensor float32, input_tail or None)
+    """
+    completed: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    ckpt_path = Path(checkpoint_dir)
+    if not ckpt_path.exists():
+        return completed
+
+    for json_path in sorted(ckpt_path.glob('chunk_????.json')):
+        try:
+            chunk_idx = int(json_path.stem.split('_')[1])
+        except (IndexError, ValueError):
+            continue
+
+        pt_path = ckpt_path / f'chunk_{chunk_idx:04d}.pt'
+        tail_path = ckpt_path / f'chunk_{chunk_idx:04d}_input_tail.pt'
+
+        if any(ckpt_path.glob(f'chunk_{chunk_idx:04d}*.tmp')):
+            continue  # crash mid-write — redo this chunk
+
+        if not pt_path.exists() or not tail_path.exists():
+            continue
+
+        try:
+            result = torch.load(str(pt_path), map_location='cpu', weights_only=True).to(torch.float32)
+            raw_tail = torch.load(str(tail_path), map_location='cpu', weights_only=True)
+            tail: Optional[torch.Tensor] = raw_tail if raw_tail.numel() > 0 else None
+            completed[chunk_idx] = (result, tail)
+        except Exception:
+            continue  # corrupt checkpoint — redo this chunk
+
+    return completed
+
+
 def _stream_video_chunks(
     cap: cv2.VideoCapture,
     frames_to_process: int,
@@ -630,7 +723,8 @@ def _stream_video_chunks(
     log_progress: bool = False,
     total_chunks: int = 0,
     cleanup_timer_name: Optional[str] = None,
-    log_prefix: str = ""
+    log_prefix: str = "",
+    checkpoint_dir: Optional[str] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     Generator that streams and processes video chunks.
@@ -652,6 +746,7 @@ def _stream_video_chunks(
         total_chunks: Total chunks for progress display (used if log_progress=True)
         cleanup_timer_name: Optional timer name for memory cleanup logging
         log_prefix: Optional prefix for log messages (e.g., "[GPU 0] " for worker identification)
+        checkpoint_dir: If set, save a checkpoint after each chunk and resume from existing ones
     
     Yields:
         Processed frames tensor [T, H, W, C] for each chunk, context frames removed
@@ -661,7 +756,18 @@ def _stream_video_chunks(
     prev_raw_tail = None
     chunk_idx = 0
     streaming = chunk_size < frames_to_process
-    
+
+    # Load any existing checkpoints and announce resume if applicable
+    completed_chunks: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    if checkpoint_dir:
+        completed_chunks = _scan_checkpoints(checkpoint_dir)
+        if completed_chunks:
+            n_done = max(completed_chunks.keys())
+            debug.log(
+                f"{log_prefix}Checkpoint resume: {n_done} chunk(s) already complete — skipping ahead",
+                category="generation", force=True,
+            )
+
     while frames_read < frames_to_process:
         read_count = min(chunk_size, frames_to_process - frames_read)
         new_frames = _read_frames_from_cap(cap, read_count)
@@ -669,7 +775,26 @@ def _stream_video_chunks(
             break
         frames_read += new_frames.shape[0]
         chunk_idx += 1
-        
+
+        # Resume path: replay this chunk from checkpoint without any GPU work
+        if chunk_idx in completed_chunks:
+            cached_result, cached_tail = completed_chunks[chunk_idx]
+            prev_raw_tail = cached_tail  # restore context for the next chunk
+            if log_progress and streaming:
+                if chunk_idx > 1:
+                    debug.log("", category="none", force=True)
+                    debug.log("━" * 60, category="none", force=True)
+                debug.log("", category="none", force=True)
+                debug.log(
+                    f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: loaded from checkpoint (skipping inference)",
+                    category="generation", force=True,
+                )
+            del new_frames
+            yield cached_result
+            if streaming:
+                clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+            continue
+
         # Disable prepend_frames after first chunk
         if chunk_idx > 1:
             chunk_args.prepend_frames = 0
@@ -707,6 +832,22 @@ def _stream_video_chunks(
         
         # Save tail for next chunk context
         prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
+
+        # Checkpoint: save after every chunk so a restart can skip completed work
+        if checkpoint_dir:
+            _save_chunk_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                chunk_idx=chunk_idx,
+                result=result,
+                input_tail=prev_raw_tail,
+                frame_start=frames_read - new_frames.shape[0],
+                frame_end=frames_read,
+                total_chunks=total_chunks,
+            )
+            debug.log(
+                f"Checkpoint saved: chunk {chunk_idx}/{total_chunks}",
+                category="generation", force=True,
+            )
         
         # Cleanup before yield
         del frames
