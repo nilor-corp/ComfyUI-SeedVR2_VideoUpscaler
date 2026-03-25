@@ -135,6 +135,8 @@ from src.utils.debug import Debug
 from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cuda_available
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
+_CHECKPOINT_MAX_ATTEMPTS = 3  # Per-chunk failure limit before giving up
+
 
 # =============================================================================
 # FFMPEG Class
@@ -534,10 +536,11 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         
         # Single GPU: stream in main process
         else:
-            # Checkpoints live alongside the output file: <output_dir>/checkpoints/
+            # Checkpoints live alongside the output file: <output_dir>/_checkpoint/
+            # Underscore prefix signals internal/transient dir — won't collide with outputs.
             # Only active in streaming mode; skipped for single-chunk (non-streaming) runs.
             ckpt_dir = (
-                os.path.join(str(Path(output_path).parent), 'checkpoints')
+                os.path.join(str(Path(output_path).parent), '_checkpoint')
                 if streaming and output_path
                 else None
             )
@@ -670,20 +673,26 @@ def _save_chunk_checkpoint(
     os.rename(base + '.json.tmp', base + '.json')
 
 
-def _scan_checkpoints(checkpoint_dir: str) -> Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+def _scan_checkpoints(
+    checkpoint_dir: str,
+) -> Tuple[Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]], Optional[str]]:
     """
     Scan a checkpoint directory for completed chunks.
 
     A chunk is complete when all three files exist (.pt, _input_tail.pt, .json)
     and no .tmp orphans are present (which indicate a crash mid-write).
 
+    Returns only the **contiguous prefix** starting from chunk 1 — if chunks
+    1, 2, 3, 5 are complete, returns {1, 2, 3} and includes a gap warning
+    about chunk 5 existing beyond the missing chunk 4.
+
     Returns:
-        Dict mapping chunk_idx -> (result_tensor float32, input_tail or None)
+        (contiguous_prefix_dict, gap_warning_str_or_None)
     """
-    completed: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    all_complete: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
     ckpt_path = Path(checkpoint_dir)
     if not ckpt_path.exists():
-        return completed
+        return all_complete, None
 
     for json_path in sorted(ckpt_path.glob('chunk_????.json')):
         try:
@@ -704,11 +713,71 @@ def _scan_checkpoints(checkpoint_dir: str) -> Dict[int, Tuple[torch.Tensor, Opti
             result = torch.load(str(pt_path), map_location='cpu', weights_only=True).to(torch.float32)
             raw_tail = torch.load(str(tail_path), map_location='cpu', weights_only=True)
             tail: Optional[torch.Tensor] = raw_tail if raw_tail.numel() > 0 else None
-            completed[chunk_idx] = (result, tail)
+            all_complete[chunk_idx] = (result, tail)
         except Exception:
             continue  # corrupt checkpoint — redo this chunk
 
-    return completed
+    if not all_complete:
+        return all_complete, None
+
+    # Build contiguous prefix: 1, 2, 3, ... stopping at the first gap
+    contiguous: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    expected = 1
+    while expected in all_complete:
+        contiguous[expected] = all_complete[expected]
+        expected += 1
+
+    # Detect chunks that exist beyond the first gap
+    gap_warning: Optional[str] = None
+    orphaned = sorted(k for k in all_complete if k not in contiguous)
+    if orphaned:
+        first_missing = expected
+        gap_warning = (
+            f"Checkpoint gap detected: chunk {first_missing} is missing but "
+            f"chunks {orphaned} exist beyond it — resuming from chunk {first_missing}, "
+            f"orphaned checkpoints will not be used"
+        )
+
+    return contiguous, gap_warning
+
+
+def _count_chunk_failures(checkpoint_dir: str, chunk_idx: int) -> int:
+    """
+    Return the number of times chunk_idx has started but not completed.
+
+    Each failed attempt leaves behind a .started[.N] marker file.
+    The markers are cleaned up on successful completion, so any that
+    remain indicate prior crashes.
+    """
+    return len(list(Path(checkpoint_dir).glob(f'chunk_{chunk_idx:04d}.started*')))
+
+
+def _write_start_marker(checkpoint_dir: str, chunk_idx: int) -> None:
+    """
+    Write a .started marker before processing begins.
+
+    Naming convention: first attempt → chunk_NNNN.started
+                       second attempt → chunk_NNNN.started.1
+                       third attempt  → chunk_NNNN.started.2
+    A crash leaves the marker in place; the count of existing markers
+    equals the number of previous failures.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    n = _count_chunk_failures(checkpoint_dir, chunk_idx)
+    if n == 0:
+        marker = os.path.join(checkpoint_dir, f'chunk_{chunk_idx:04d}.started')
+    else:
+        marker = os.path.join(checkpoint_dir, f'chunk_{chunk_idx:04d}.started.{n}')
+    Path(marker).touch()
+
+
+def _clear_start_markers(checkpoint_dir: str, chunk_idx: int) -> None:
+    """Delete all .started markers for chunk_idx after successful completion."""
+    for f in Path(checkpoint_dir).glob(f'chunk_{chunk_idx:04d}.started*'):
+        try:
+            f.unlink()
+        except OSError:
+            pass
 
 
 def _stream_video_chunks(
@@ -760,11 +829,15 @@ def _stream_video_chunks(
     # Load any existing checkpoints and announce resume if applicable
     completed_chunks: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
     if checkpoint_dir:
-        completed_chunks = _scan_checkpoints(checkpoint_dir)
+        completed_chunks, gap_warning = _scan_checkpoints(checkpoint_dir)
+        if gap_warning:
+            debug.log(gap_warning, level="WARNING", category="generation", force=True)
         if completed_chunks:
             n_done = max(completed_chunks.keys())
+            resume_from = n_done + 1
             debug.log(
-                f"{log_prefix}Checkpoint resume: {n_done} chunk(s) already complete — skipping ahead",
+                f"{log_prefix}Resuming from checkpoint: {n_done} chunk(s) complete, "
+                f"continuing from chunk {resume_from}",
                 category="generation", force=True,
             )
 
@@ -795,6 +868,18 @@ def _stream_video_chunks(
                 clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
             continue
 
+        # Retry guard: if this chunk has already failed _CHECKPOINT_MAX_ATTEMPTS times, give up
+        if checkpoint_dir:
+            prior_failures = _count_chunk_failures(checkpoint_dir, chunk_idx)
+            if prior_failures >= _CHECKPOINT_MAX_ATTEMPTS:
+                debug.log(
+                    f"Chunk {chunk_idx} has failed {_CHECKPOINT_MAX_ATTEMPTS} times — giving up. "
+                    f"Check logs and {checkpoint_dir} for details.",
+                    level="ERROR", category="generation", force=True,
+                )
+                import sys as _sys
+                _sys.exit(1)
+
         # Disable prepend_frames after first chunk
         if chunk_idx > 1:
             chunk_args.prepend_frames = 0
@@ -816,6 +901,15 @@ def _stream_video_chunks(
             debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames", 
                      category="generation", force=True)
             debug.log("", category="none", force=True)
+
+        # Mark that this chunk is starting; file persists on crash as a failure record
+        if checkpoint_dir:
+            _write_start_marker(checkpoint_dir, chunk_idx)
+            frame_start = frames_read - new_frames.shape[0]
+            debug.log(
+                f"Saving checkpoint for chunk {chunk_idx} (frames {frame_start}-{frames_read})",
+                category="generation", force=True,
+            )
         
         # Process chunk
         result = _process_frames_core(
@@ -844,8 +938,9 @@ def _stream_video_chunks(
                 frame_end=frames_read,
                 total_chunks=total_chunks,
             )
+            _clear_start_markers(checkpoint_dir, chunk_idx)
             debug.log(
-                f"Checkpoint saved: chunk {chunk_idx}/{total_chunks}",
+                f"Chunk {chunk_idx}/{total_chunks} checkpointed successfully",
                 category="generation", force=True,
             )
         
